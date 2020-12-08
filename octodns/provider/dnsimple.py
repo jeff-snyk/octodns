@@ -30,16 +30,19 @@ class DnsimpleClientUnauthorized(DnsimpleClientException):
 
 
 class DnsimpleClient(object):
-    BASE = 'https://api.dnsimple.com/v2/'
 
-    def __init__(self, token, account):
+    def __init__(self, token, account, sandbox):
         self.account = account
         sess = Session()
         sess.headers.update({'Authorization': 'Bearer {}'.format(token)})
         self._sess = sess
+        if sandbox:
+            self.base = 'https://api.sandbox.dnsimple.com/v2/'
+        else:
+            self.base = 'https://api.dnsimple.com/v2/'
 
     def _request(self, method, path, params=None, data=None):
-        url = '{}{}{}'.format(self.BASE, self.account, path)
+        url = '{}{}{}'.format(self.base, self.account, path)
         resp = self._sess.request(method, url, params=params, json=data)
         if resp.status_code == 401:
             raise DnsimpleClientUnauthorized()
@@ -89,16 +92,19 @@ class DnsimpleProvider(BaseProvider):
         token: letmein
         # Your account number (required)
         account: 42
+        # Use sandbox (optional)
+        sandbox: true
     '''
     SUPPORTS_GEO = False
+    SUPPORTS_DYNAMIC = False
     SUPPORTS = set(('A', 'AAAA', 'ALIAS', 'CAA', 'CNAME', 'MX', 'NAPTR', 'NS',
                     'PTR', 'SPF', 'SRV', 'SSHFP', 'TXT'))
 
-    def __init__(self, id, token, account, *args, **kwargs):
+    def __init__(self, id, token, account, sandbox=False, *args, **kwargs):
         self.log = logging.getLogger('DnsimpleProvider[{}]'.format(id))
         self.log.debug('__init__: id=%s, token=***, account=%s', id, account)
         super(DnsimpleProvider, self).__init__(id, *args, **kwargs)
-        self._client = DnsimpleClient(token, account)
+        self._client = DnsimpleClient(token, account, sandbox)
 
         self._zone_records = {}
 
@@ -112,7 +118,14 @@ class DnsimpleProvider(BaseProvider):
     _data_for_A = _data_for_multiple
     _data_for_AAAA = _data_for_multiple
     _data_for_SPF = _data_for_multiple
-    _data_for_TXT = _data_for_multiple
+
+    def _data_for_TXT(self, _type, records):
+        return {
+            'ttl': records[0]['ttl'],
+            'type': _type,
+            # escape semicolons
+            'values': [r['content'].replace(';', '\\;') for r in records]
+        }
 
     def _data_for_CAA(self, _type, records):
         values = []
@@ -160,7 +173,7 @@ class DnsimpleProvider(BaseProvider):
                     record['content'].split(' ', 5)
             except ValueError:
                 # their api will let you create invalid records, this
-                # essnetially handles that by ignoring them for values
+                # essentially handles that by ignoring them for values
                 # purposes. That will cause updates to happen to delete them if
                 # they shouldn't exist or update them if they're wrong
                 continue
@@ -256,7 +269,7 @@ class DnsimpleProvider(BaseProvider):
         values = defaultdict(lambda: defaultdict(list))
         for record in self.zone_records(zone):
             _type = record['type']
-            if _type == 'SOA':
+            if _type not in self.SUPPORTS:
                 continue
             elif _type == 'TXT' and record['content'].startswith('ALIAS for'):
                 # ALIAS has a "ride along" TXT record with 'ALIAS for XXXX',
@@ -270,10 +283,12 @@ class DnsimpleProvider(BaseProvider):
                 data_for = getattr(self, '_data_for_{}'.format(_type))
                 record = Record.new(zone, name, data_for(_type, records),
                                     source=self, lenient=lenient)
-                zone.add_record(record)
+                zone.add_record(record, lenient=lenient)
 
-        self.log.info('populate:   found %s records',
-                      len(zone.records) - before)
+        exists = zone.name in self._zone_records
+        self.log.info('populate:   found %s records, exists=%s',
+                      len(zone.records) - before, exists)
+        return exists
 
     def _params_for_multiple(self, record):
         for value in record.values:
@@ -288,7 +303,16 @@ class DnsimpleProvider(BaseProvider):
     _params_for_AAAA = _params_for_multiple
     _params_for_NS = _params_for_multiple
     _params_for_SPF = _params_for_multiple
-    _params_for_TXT = _params_for_multiple
+
+    def _params_for_TXT(self, record):
+        for value in record.values:
+            yield {
+                # un-escape semicolons
+                'content': value.replace('\\', ''),
+                'name': record.name,
+                'ttl': record.ttl,
+                'type': record._type,
+            }
 
     def _params_for_CAA(self, record):
         for value in record.values:

@@ -5,14 +5,15 @@
 from __future__ import absolute_import, division, print_function, \
     unicode_literals
 
-from StringIO import StringIO
 from concurrent.futures import ThreadPoolExecutor
 from importlib import import_module
 from os import environ
+from six import text_type
 import logging
 
 from .provider.base import BaseProvider
-from .provider.yaml import YamlProvider
+from .provider.plan import Plan
+from .provider.yaml import SplitYamlProvider, YamlProvider
 from .record import Record
 from .yaml import safe_load
 from .zone import Zone
@@ -37,6 +38,13 @@ class _AggregateTarget(object):
                 return False
         return True
 
+    @property
+    def SUPPORTS_DYNAMIC(self):
+        for target in self.targets:
+            if not target.SUPPORTS_DYNAMIC:
+                return False
+        return True
+
 
 class MakeThreadFuture(object):
 
@@ -51,7 +59,7 @@ class MakeThreadFuture(object):
 
 class MainThreadExecutor(object):
     '''
-    Dummy executor that runs things on the main thread during the involcation
+    Dummy executor that runs things on the main thread during the invocation
     of submit, but still returns a future object with the result. This allows
     code to be written to handle async, even in the case where we don't want to
     use multiple threads/workers and would prefer that things flow as if
@@ -62,8 +70,17 @@ class MainThreadExecutor(object):
         return MakeThreadFuture(func, args, kwargs)
 
 
+class ManagerException(Exception):
+    pass
+
+
 class Manager(object):
     log = logging.getLogger('Manager')
+
+    @classmethod
+    def _plan_keyer(cls, p):
+        plan = p[1]
+        return len(plan.changes[0].record.zone.name) if plan.changes else 0
 
     def __init__(self, config_file, max_workers=None, include_meta=False):
         self.log.info('__init__: config_file=%s', config_file)
@@ -83,7 +100,7 @@ class Manager(object):
 
         self.include_meta = include_meta or manager_config.get('include_meta',
                                                                False)
-        self.log.info('__init__:   max_workers=%s', self.include_meta)
+        self.log.info('__init__:   include_meta=%s', self.include_meta)
 
         self.log.debug('__init__:   configuring providers')
         self.providers = {}
@@ -93,31 +110,16 @@ class Manager(object):
                 _class = provider_config.pop('class')
             except KeyError:
                 self.log.exception('Invalid provider class')
-                raise Exception('Provider {} is missing class'
-                                .format(provider_name))
-            _class = self._get_provider_class(_class)
-            # Build up the arguments we need to pass to the provider
-            kwargs = {}
-            for k, v in provider_config.items():
-                try:
-                    if v.startswith('env/'):
-                        try:
-                            env_var = v[4:]
-                            v = environ[env_var]
-                        except KeyError:
-                            self.log.exception('Invalid provider config')
-                            raise Exception('Incorrect provider config, '
-                                            'missing env var {}'
-                                            .format(env_var))
-                except AttributeError:
-                    pass
-                kwargs[k] = v
+                raise ManagerException('Provider {} is missing class'
+                                       .format(provider_name))
+            _class = self._get_named_class('provider', _class)
+            kwargs = self._build_kwargs(provider_config)
             try:
                 self.providers[provider_name] = _class(provider_name, **kwargs)
             except TypeError:
                 self.log.exception('Invalid provider config')
-                raise Exception('Incorrect provider config for {}'
-                                .format(provider_name))
+                raise ManagerException('Incorrect provider config for {}'
+                                       .format(provider_name))
 
         zone_tree = {}
         # sort by reversed strings so that parent zones always come first
@@ -139,20 +141,66 @@ class Manager(object):
                     where = where[piece]
         self.zone_tree = zone_tree
 
-    def _get_provider_class(self, _class):
+        self.plan_outputs = {}
+        plan_outputs = manager_config.get('plan_outputs', {
+            'logger': {
+                'class': 'octodns.provider.plan.PlanLogger',
+                'level': 'info'
+            }
+        })
+        for plan_output_name, plan_output_config in plan_outputs.items():
+            try:
+                _class = plan_output_config.pop('class')
+            except KeyError:
+                self.log.exception('Invalid plan_output class')
+                raise ManagerException('plan_output {} is missing class'
+                                       .format(plan_output_name))
+            _class = self._get_named_class('plan_output', _class)
+            kwargs = self._build_kwargs(plan_output_config)
+            try:
+                self.plan_outputs[plan_output_name] = \
+                    _class(plan_output_name, **kwargs)
+            except TypeError:
+                self.log.exception('Invalid plan_output config')
+                raise ManagerException('Incorrect plan_output config for {}'
+                                       .format(plan_output_name))
+
+    def _get_named_class(self, _type, _class):
         try:
             module_name, class_name = _class.rsplit('.', 1)
             module = import_module(module_name)
         except (ImportError, ValueError):
-            self.log.exception('_get_provider_class: Unable to import '
+            self.log.exception('_get_{}_class: Unable to import '
                                'module %s', _class)
-            raise Exception('Unknown provider class: {}'.format(_class))
+            raise ManagerException('Unknown {} class: {}'
+                                   .format(_type, _class))
         try:
             return getattr(module, class_name)
         except AttributeError:
-            self.log.exception('_get_provider_class: Unable to get class %s '
+            self.log.exception('_get_{}_class: Unable to get class %s '
                                'from module %s', class_name, module)
-            raise Exception('Unknown provider class: {}'.format(_class))
+            raise ManagerException('Unknown {} class: {}'
+                                   .format(_type, _class))
+
+    def _build_kwargs(self, source):
+        # Build up the arguments we need to pass to the provider
+        kwargs = {}
+        for k, v in source.items():
+            try:
+                if v.startswith('env/'):
+                    try:
+                        env_var = v[4:]
+                        v = environ[env_var]
+                    except KeyError:
+                        self.log.exception('Invalid provider config')
+                        raise ManagerException('Incorrect provider config, '
+                                               'missing env var {}'
+                                               .format(env_var))
+            except AttributeError:
+                pass
+            kwargs[k] = v
+
+        return kwargs
 
     def configured_sub_zones(self, zone_name):
         # Reversed pieces of the zone name
@@ -174,13 +222,31 @@ class Manager(object):
         self.log.debug('configured_sub_zones: subs=%s', sub_zone_names)
         return set(sub_zone_names)
 
-    def _populate_and_plan(self, zone_name, sources, targets):
+    def _populate_and_plan(self, zone_name, sources, targets, desired=None,
+                           lenient=False):
 
-        self.log.debug('sync:   populating, zone=%s', zone_name)
+        self.log.debug('sync:   populating, zone=%s, lenient=%s',
+                       zone_name, lenient)
         zone = Zone(zone_name,
                     sub_zones=self.configured_sub_zones(zone_name))
-        for source in sources:
-            source.populate(zone)
+
+        if desired:
+            # This is an alias zone, rather than populate it we'll copy the
+            # records over from `desired`.
+            for _, records in desired._records.items():
+                for record in records:
+                    zone.add_record(record.copy(zone=zone), lenient=lenient)
+
+        else:
+            for source in sources:
+                try:
+                    source.populate(zone, lenient=lenient)
+                except TypeError as e:
+                    if "keyword argument 'lenient'" not in text_type(e):
+                        raise
+                    self.log.warn(': provider %s does not accept lenient '
+                                  'param', source.__class__.__name__)
+                    source.populate(zone)
 
         self.log.debug('sync:   planning, zone=%s', zone_name)
         plans = []
@@ -197,32 +263,65 @@ class Manager(object):
             if plan:
                 plans.append((target, plan))
 
-        return plans
+        # Return the zone as it's the desired state
+        return plans, zone
 
-    def sync(self, eligible_zones=[], eligible_targets=[], dry_run=True,
-             force=False):
+    def sync(self, eligible_zones=[], eligible_sources=[], eligible_targets=[],
+             dry_run=True, force=False):
         self.log.info('sync: eligible_zones=%s, eligible_targets=%s, '
                       'dry_run=%s, force=%s', eligible_zones, eligible_targets,
                       dry_run, force)
 
         zones = self.config['zones'].items()
         if eligible_zones:
-            zones = filter(lambda d: d[0] in eligible_zones, zones)
+            zones = [z for z in zones if z[0] in eligible_zones]
 
+        aliased_zones  = {}
         futures = []
         for zone_name, config in zones:
             self.log.info('sync:   zone=%s', zone_name)
+            if 'alias' in config:
+                source_zone = config['alias']
+
+                # Check that the source zone is defined.
+                if source_zone not in self.config['zones']:
+                    self.log.error('Invalid alias zone {}, target {} does '
+                                   'not exist'.format(zone_name, source_zone))
+                    raise ManagerException('Invalid alias zone {}: '
+                                           'source zone {} does not exist'
+                                           .format(zone_name, source_zone))
+
+                # Check that the source zone is not an alias zone itself.
+                if 'alias' in self.config['zones'][source_zone]:
+                    self.log.error('Invalid alias zone {}, target {} is an '
+                                   'alias zone'.format(zone_name, source_zone))
+                    raise ManagerException('Invalid alias zone {}: source '
+                                           'zone {} is an alias zone'
+                                           .format(zone_name, source_zone))
+
+                aliased_zones[zone_name] = source_zone
+                continue
+
+            lenient = config.get('lenient', False)
             try:
                 sources = config['sources']
             except KeyError:
-                raise Exception('Zone {} is missing sources'.format(zone_name))
+                raise ManagerException('Zone {} is missing sources'
+                                       .format(zone_name))
 
             try:
                 targets = config['targets']
             except KeyError:
-                raise Exception('Zone {} is missing targets'.format(zone_name))
+                raise ManagerException('Zone {} is missing targets'
+                                       .format(zone_name))
+
+            if (eligible_sources and not
+                    [s for s in sources if s in eligible_sources]):
+                self.log.info('sync:   no eligible sources, skipping')
+                continue
+
             if eligible_targets:
-                targets = filter(lambda d: d in eligible_targets, targets)
+                targets = [t for t in targets if t in eligible_targets]
 
             if not targets:
                 # Don't bother planning (and more importantly populating) zones
@@ -234,64 +333,70 @@ class Manager(object):
             self.log.info('sync:   sources=%s -> targets=%s', sources, targets)
 
             try:
-                sources = [self.providers[source] for source in sources]
+                # rather than using a list comprehension, we break this loop
+                # out so that the `except` block below can reference the
+                # `source`
+                collected = []
+                for source in sources:
+                    collected.append(self.providers[source])
+                sources = collected
             except KeyError:
-                raise Exception('Zone {}, unknown source: {}'.format(zone_name,
-                                                                     source))
+                raise ManagerException('Zone {}, unknown source: {}'
+                                       .format(zone_name, source))
 
             try:
                 trgs = []
                 for target in targets:
                     trg = self.providers[target]
                     if not isinstance(trg, BaseProvider):
-                        raise Exception('{} - "{}" does not support targeting'
-                                        .format(trg, target))
+                        raise ManagerException('{} - "{}" does not support '
+                                               'targeting'.format(trg, target))
                     trgs.append(trg)
                 targets = trgs
             except KeyError:
-                raise Exception('Zone {}, unknown target: {}'.format(zone_name,
-                                                                     target))
+                raise ManagerException('Zone {}, unknown target: {}'
+                                       .format(zone_name, target))
 
             futures.append(self._executor.submit(self._populate_and_plan,
-                                                 zone_name, sources, targets))
+                                                 zone_name, sources,
+                                                 targets, lenient=lenient))
 
-        # Wait on all results and unpack/flatten them in to a list of target &
-        # plan pairs.
-        plans = [p for f in futures for p in f.result()]
+        # Wait on all results and unpack/flatten the plans and store the
+        # desired states in case we need them below
+        plans = []
+        desired = {}
+        for future in futures:
+            ps, d = future.result()
+            desired[d.name] = d
+            for plan in ps:
+                plans.append(plan)
 
-        hr = '*************************************************************' \
-            '*******************\n'
-        buf = StringIO()
-        buf.write('\n')
-        if plans:
-            current_zone = None
-            for target, plan in plans:
-                if plan.desired.name != current_zone:
-                    current_zone = plan.desired.name
-                    buf.write(hr)
-                    buf.write('* ')
-                    buf.write(current_zone)
-                    buf.write('\n')
-                    buf.write(hr)
+        # Populate aliases zones.
+        futures = []
+        for zone_name, zone_source in aliased_zones.items():
+            source_config = self.config['zones'][zone_source]
+            futures.append(self._executor.submit(
+                self._populate_and_plan,
+                zone_name,
+                [],
+                [self.providers[t] for t in source_config['targets']],
+                desired=desired[zone_source],
+                lenient=lenient
+            ))
 
-                buf.write('* ')
-                buf.write(target.id)
-                buf.write(' (')
-                buf.write(target)
-                buf.write(')\n*   ')
-                for change in plan.changes:
-                    buf.write(change.__repr__(leader='* '))
-                    buf.write('\n*   ')
+        # Wait on results and unpack/flatten the plans, ignore the desired here
+        # as these are aliased zones
+        plans += [p for f in futures for p in f.result()[0]]
 
-                buf.write('Summary: ')
-                buf.write(plan)
-                buf.write('\n')
-        else:
-            buf.write(hr)
-            buf.write('No changes were planned\n')
-        buf.write(hr)
-        buf.write('\n')
-        self.log.info(buf.getvalue())
+        # Best effort sort plans children first so that we create/update
+        # children zones before parents which should allow us to more safely
+        # extract things into sub-zones. Combining a child back into a parent
+        # can't really be done all that safely in general so we'll optimize for
+        # this direction.
+        plans.sort(key=self._plan_keyer, reverse=True)
+
+        for output in self.plan_outputs.values():
+            output.run(plans=plans, log=self.log)
 
         if not force:
             self.log.debug('sync:   checking safety')
@@ -327,20 +432,19 @@ class Manager(object):
             a = [self.providers[source] for source in a]
             b = [self.providers[source] for source in b]
         except KeyError as e:
-            raise Exception('Unknown source: {}'.format(e.args[0]))
+            raise ManagerException('Unknown source: {}'.format(e.args[0]))
 
-        sub_zones = self.configured_sub_zones(zone)
-        za = Zone(zone, sub_zones)
+        za = self.get_zone(zone)
         for source in a:
             source.populate(za)
 
-        zb = Zone(zone, sub_zones)
+        zb = self.get_zone(zone)
         for source in b:
             source.populate(zb)
 
         return zb.changes(za, _AggregateTarget(a + b))
 
-    def dump(self, zone, output_dir, lenient, source, *sources):
+    def dump(self, zone, output_dir, lenient, split, source, *sources):
         '''
         Dump zone data from the specified source
         '''
@@ -353,32 +457,74 @@ class Manager(object):
         try:
             sources = [self.providers[s] for s in sources]
         except KeyError as e:
-            raise Exception('Unknown source: {}'.format(e.args[0]))
+            raise ManagerException('Unknown source: {}'.format(e.args[0]))
 
-        target = YamlProvider('dump', output_dir)
+        clz = YamlProvider
+        if split:
+            clz = SplitYamlProvider
+        target = clz('dump', output_dir)
 
         zone = Zone(zone, self.configured_sub_zones(zone))
         for source in sources:
             source.populate(zone, lenient=lenient)
 
         plan = target.plan(zone)
+        if plan is None:
+            plan = Plan(zone, zone, [], False)
         target.apply(plan)
 
     def validate_configs(self):
         for zone_name, config in self.config['zones'].items():
             zone = Zone(zone_name, self.configured_sub_zones(zone_name))
 
+            source_zone = config.get('alias')
+            if source_zone:
+                if source_zone not in self.config['zones']:
+                    self.log.exception('Invalid alias zone')
+                    raise ManagerException('Invalid alias zone {}: '
+                                           'source zone {} does not exist'
+                                           .format(zone_name, source_zone))
+
+                if 'alias' in self.config['zones'][source_zone]:
+                    self.log.exception('Invalid alias zone')
+                    raise ManagerException('Invalid alias zone {}: '
+                                           'source zone {} is an alias zone'
+                                           .format(zone_name, source_zone))
+
+                # this is just here to satisfy coverage, see
+                # https://github.com/nedbat/coveragepy/issues/198
+                source_zone = source_zone
+                continue
+
             try:
                 sources = config['sources']
             except KeyError:
-                raise Exception('Zone {} is missing sources'.format(zone_name))
+                raise ManagerException('Zone {} is missing sources'
+                                       .format(zone_name))
 
             try:
-                sources = [self.providers[source] for source in sources]
+                # rather than using a list comprehension, we break this
+                # loop out so that the `except` block below can reference
+                # the `source`
+                collected = []
+                for source in sources:
+                    collected.append(self.providers[source])
+                sources = collected
             except KeyError:
-                raise Exception('Zone {}, unknown source: {}'.format(zone_name,
-                                                                     source))
+                raise ManagerException('Zone {}, unknown source: {}'
+                                       .format(zone_name, source))
 
             for source in sources:
                 if isinstance(source, YamlProvider):
                     source.populate(zone)
+
+    def get_zone(self, zone_name):
+        if not zone_name[-1] == '.':
+            raise ManagerException('Invalid zone name {}, missing ending dot'
+                                   .format(zone_name))
+
+        for name, config in self.config['zones'].items():
+            if name == zone_name:
+                return Zone(name, self.configured_sub_zones(name))
+
+        raise ManagerException('Unknown zone name {}'.format(zone_name))

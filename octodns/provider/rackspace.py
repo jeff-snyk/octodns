@@ -7,11 +7,14 @@ from __future__ import absolute_import, division, print_function, \
 from requests import HTTPError, Session, post
 from collections import defaultdict
 import logging
-import string
 import time
 
 from ..record import Record
 from .base import BaseProvider
+
+
+def _value_keyer(v):
+    return (v.get('type', ''), v['name'], v.get('data', ''))
 
 
 def add_trailing_dot(s):
@@ -28,21 +31,22 @@ def remove_trailing_dot(s):
 
 def escape_semicolon(s):
     assert s
-    return string.replace(s, ';', '\;')
+    return s.replace(';', '\\;')
 
 
 def unescape_semicolon(s):
     assert s
-    return string.replace(s, '\;', ';')
+    return s.replace('\\;', ';')
 
 
 class RackspaceProvider(BaseProvider):
     SUPPORTS_GEO = False
+    SUPPORTS_DYNAMIC = False
     SUPPORTS = set(('A', 'AAAA', 'ALIAS', 'CNAME', 'MX', 'NS', 'PTR', 'SPF',
                     'TXT'))
     TIMEOUT = 5
 
-    def __init__(self, id, username, api_key, ratelimit_delay, *args,
+    def __init__(self, id, username, api_key, ratelimit_delay=0.0, *args,
                  **kwargs):
         '''
         Rackspace API v1 Provider
@@ -83,7 +87,6 @@ class RackspaceProvider(BaseProvider):
 
     def _get_zone_id_for(self, zone):
         ret = self._request('GET', 'domains', pagination_key='domains')
-        time.sleep(self.ratelimit_delay)
         return [x for x in ret if x['name'] == zone.name[:-1]][0]['id']
 
     def _request(self, method, path, data=None, pagination_key=None):
@@ -91,14 +94,15 @@ class RackspaceProvider(BaseProvider):
         url = '{}/{}'.format(self.dns_endpoint, path)
 
         if pagination_key:
-            return self._paginated_request_for_url(method, url, data,
+            resp = self._paginated_request_for_url(method, url, data,
                                                    pagination_key)
         else:
-            return self._request_for_url(method, url, data)
+            resp = self._request_for_url(method, url, data)
+        time.sleep(self.ratelimit_delay)
+        return resp
 
     def _request_for_url(self, method, url, data):
         resp = self._sess.request(method, url, json=data, timeout=self.TIMEOUT)
-        time.sleep(self.ratelimit_delay)
         self.log.debug('_request:   status=%d', resp.status_code)
         resp.raise_for_status()
         return resp
@@ -107,7 +111,6 @@ class RackspaceProvider(BaseProvider):
         acc = []
 
         resp = self._sess.request(method, url, json=data, timeout=self.TIMEOUT)
-        time.sleep(self.ratelimit_delay)
         self.log.debug('_request:   status=%d', resp.status_code)
         resp.raise_for_status()
         acc.extend(resp.json()[pagination_key])
@@ -131,17 +134,9 @@ class RackspaceProvider(BaseProvider):
     def _delete(self, path, data=None):
         return self._request('DELETE', path, data=data)
 
-    @staticmethod
-    def _as_unicode(s, codec):
-        if not isinstance(s, unicode):
-            return unicode(s, codec)
-        return s
-
     @classmethod
     def _key_for_record(cls, rs_record):
-        return cls._as_unicode(rs_record['type'], 'ascii'), \
-            cls._as_unicode(rs_record['name'], 'utf-8'), \
-            cls._as_unicode(rs_record['data'], 'utf-8')
+        return rs_record['type'], rs_record['name'], rs_record['data']
 
     def _data_for_multiple(self, rrset):
         return {
@@ -209,7 +204,7 @@ class RackspaceProvider(BaseProvider):
                 raise Exception('Rackspace request unauthorized')
             elif e.response.status_code == 404:
                 # Zone not found leaves the zone empty instead of failing.
-                return
+                return False
             raise
 
         before = len(zone.records)
@@ -224,10 +219,11 @@ class RackspaceProvider(BaseProvider):
                     record = Record.new(zone, record_name,
                                         data_for(record_set),
                                         source=self)
-                    zone.add_record(record)
+                    zone.add_record(record, lenient=lenient)
 
-        self.log.info('populate:   found %s records',
+        self.log.info('populate:   found %s records, exists=True',
                       len(zone.records) - before)
+        return True
 
     def _group_records(self, all_records):
         records = defaultdict(lambda: defaultdict(list))
@@ -295,12 +291,8 @@ class RackspaceProvider(BaseProvider):
                                                 self._get_values(change.new))
 
     def _create_given_change_values(self, change, values):
-        out = []
-        for value in values:
-            transformer = getattr(self,
-                                  "_record_for_{}".format(change.new._type))
-            out.append(transformer(change.new, value))
-        return out
+        transformer = getattr(self, "_record_for_{}".format(change.new._type))
+        return [transformer(change.new, v) for v in values]
 
     def _mod_Update(self, change):
         existing_values = self._get_values(change.existing)
@@ -337,10 +329,10 @@ class RackspaceProvider(BaseProvider):
             change.existing))
 
     def _delete_given_change_values(self, change, values):
+        transformer = getattr(self, "_record_for_{}".format(
+            change.existing._type))
         out = []
         for value in values:
-            transformer = getattr(self, "_record_for_{}".format(
-                change.existing._type))
             rs_record = transformer(change.existing, value)
             key = self._key_for_record(rs_record)
             out.append('id=' + self._id_map[key])
@@ -353,6 +345,9 @@ class RackspaceProvider(BaseProvider):
         self.log.debug('_apply: zone=%s, len(changes)=%d', desired.name,
                        len(changes))
 
+        # Creates, updates, and deletes are processed by different endpoints
+        # and are broken out by record-set entries; pre-process everything
+        # into these buckets in order to minimize the number of API calls.
         domain_id = self._get_zone_id_for(desired)
         creates = []
         updates = []
@@ -375,11 +370,9 @@ class RackspaceProvider(BaseProvider):
             self._delete('domains/{}/records?{}'.format(domain_id, params))
 
         if updates:
-            data = {"records": sorted(updates, key=lambda v: v['name'])}
+            data = {"records": sorted(updates, key=_value_keyer)}
             self._put('domains/{}/records'.format(domain_id), data=data)
 
         if creates:
-            data = {"records": sorted(creates, key=lambda v: v['type'] +
-                                      v['name'] +
-                                      v.get('data', ''))}
+            data = {"records": sorted(creates, key=_value_keyer)}
             self._post('domains/{}/records'.format(domain_id), data=data)

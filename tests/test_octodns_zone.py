@@ -6,6 +6,7 @@ from __future__ import absolute_import, division, print_function, \
     unicode_literals
 
 from unittest import TestCase
+from six import text_type
 
 from octodns.record import ARecord, AaaaRecord, Create, Delete, Record, Update
 from octodns.zone import DuplicateRecordException, InvalidNodeException, \
@@ -47,7 +48,7 @@ class TestZone(TestCase):
         with self.assertRaises(DuplicateRecordException) as ctx:
             zone.add_record(a)
         self.assertEquals('Duplicate record a.unit.tests., type A',
-                          ctx.exception.message)
+                          text_type(ctx.exception))
         self.assertEquals(zone.records, set([a]))
 
         # can add duplicate with replace=True
@@ -111,6 +112,7 @@ class TestZone(TestCase):
         class NoAaaaProvider(object):
             id = 'no-aaaa'
             SUPPORTS_GEO = False
+            SUPPORTS_DYNAMIC = False
 
             def supports(self, record):
                 return record._type != 'AAAA'
@@ -136,12 +138,12 @@ class TestZone(TestCase):
     def test_missing_dot(self):
         with self.assertRaises(Exception) as ctx:
             Zone('not.allowed', [])
-        self.assertTrue('missing ending dot' in ctx.exception.message)
+        self.assertTrue('missing ending dot' in text_type(ctx.exception))
 
     def test_sub_zones(self):
-        zone = Zone('unit.tests.', set(['sub', 'barred']))
 
         # NS for exactly the sub is allowed
+        zone = Zone('unit.tests.', set(['sub', 'barred']))
         record = Record.new(zone, 'sub', {
             'ttl': 3600,
             'type': 'NS',
@@ -151,6 +153,7 @@ class TestZone(TestCase):
         self.assertEquals(set([record]), zone.records)
 
         # non-NS for exactly the sub is rejected
+        zone = Zone('unit.tests.', set(['sub', 'barred']))
         record = Record.new(zone, 'sub', {
             'ttl': 3600,
             'type': 'A',
@@ -158,9 +161,13 @@ class TestZone(TestCase):
         })
         with self.assertRaises(SubzoneRecordException) as ctx:
             zone.add_record(record)
-        self.assertTrue('not of type NS', ctx.exception.message)
+        self.assertTrue('not of type NS', text_type(ctx.exception))
+        # Can add it w/lenient
+        zone.add_record(record, lenient=True)
+        self.assertEquals(set([record]), zone.records)
 
         # NS for something below the sub is rejected
+        zone = Zone('unit.tests.', set(['sub', 'barred']))
         record = Record.new(zone, 'foo.sub', {
             'ttl': 3600,
             'type': 'NS',
@@ -168,9 +175,13 @@ class TestZone(TestCase):
         })
         with self.assertRaises(SubzoneRecordException) as ctx:
             zone.add_record(record)
-        self.assertTrue('under a managed sub-zone', ctx.exception.message)
+        self.assertTrue('under a managed sub-zone', text_type(ctx.exception))
+        # Can add it w/lenient
+        zone.add_record(record, lenient=True)
+        self.assertEquals(set([record]), zone.records)
 
         # A for something below the sub is rejected
+        zone = Zone('unit.tests.', set(['sub', 'barred']))
         record = Record.new(zone, 'foo.bar.sub', {
             'ttl': 3600,
             'type': 'A',
@@ -178,7 +189,10 @@ class TestZone(TestCase):
         })
         with self.assertRaises(SubzoneRecordException) as ctx:
             zone.add_record(record)
-        self.assertTrue('under a managed sub-zone', ctx.exception.message)
+        self.assertTrue('under a managed sub-zone', text_type(ctx.exception))
+        # Can add it w/lenient
+        zone.add_record(record, lenient=True)
+        self.assertEquals(set([record]), zone.records)
 
     def test_ignored_records(self):
         zone_normal = Zone('unit.tests.', [])
@@ -230,9 +244,114 @@ class TestZone(TestCase):
         zone.add_record(a)
         with self.assertRaises(InvalidNodeException):
             zone.add_record(cname)
+        self.assertEquals(set([a]), zone.records)
+        zone.add_record(cname, lenient=True)
+        self.assertEquals(set([a, cname]), zone.records)
 
         # add a to cname
         zone = Zone('unit.tests.', [])
         zone.add_record(cname)
         with self.assertRaises(InvalidNodeException):
             zone.add_record(a)
+        self.assertEquals(set([cname]), zone.records)
+        zone.add_record(a, lenient=True)
+        self.assertEquals(set([a, cname]), zone.records)
+
+    def test_excluded_records(self):
+        zone_normal = Zone('unit.tests.', [])
+        zone_excluded = Zone('unit.tests.', [])
+        zone_missing = Zone('unit.tests.', [])
+
+        normal = Record.new(zone_normal, 'www', {
+            'ttl': 60,
+            'type': 'A',
+            'value': '9.9.9.9',
+        })
+        zone_normal.add_record(normal)
+
+        excluded = Record.new(zone_excluded, 'www', {
+            'octodns': {
+                'excluded': ['test']
+            },
+            'ttl': 60,
+            'type': 'A',
+            'value': '9.9.9.9',
+        })
+        zone_excluded.add_record(excluded)
+
+        provider = SimpleProvider()
+
+        self.assertFalse(zone_normal.changes(zone_excluded, provider))
+        self.assertTrue(zone_normal.changes(zone_missing, provider))
+
+        self.assertFalse(zone_excluded.changes(zone_normal, provider))
+        self.assertFalse(zone_excluded.changes(zone_missing, provider))
+
+        self.assertTrue(zone_missing.changes(zone_normal, provider))
+        self.assertFalse(zone_missing.changes(zone_excluded, provider))
+
+    def test_included_records(self):
+        zone_normal = Zone('unit.tests.', [])
+        zone_included = Zone('unit.tests.', [])
+        zone_missing = Zone('unit.tests.', [])
+
+        normal = Record.new(zone_normal, 'www', {
+            'ttl': 60,
+            'type': 'A',
+            'value': '9.9.9.9',
+        })
+        zone_normal.add_record(normal)
+
+        included = Record.new(zone_included, 'www', {
+            'octodns': {
+                'included': ['test']
+            },
+            'ttl': 60,
+            'type': 'A',
+            'value': '9.9.9.9',
+        })
+        zone_included.add_record(included)
+
+        provider = SimpleProvider()
+
+        self.assertFalse(zone_normal.changes(zone_included, provider))
+        self.assertTrue(zone_normal.changes(zone_missing, provider))
+
+        self.assertFalse(zone_included.changes(zone_normal, provider))
+        self.assertTrue(zone_included.changes(zone_missing, provider))
+
+        self.assertTrue(zone_missing.changes(zone_normal, provider))
+        self.assertTrue(zone_missing.changes(zone_included, provider))
+
+    def test_not_included_records(self):
+        zone_normal = Zone('unit.tests.', [])
+        zone_included = Zone('unit.tests.', [])
+        zone_missing = Zone('unit.tests.', [])
+
+        normal = Record.new(zone_normal, 'www', {
+            'ttl': 60,
+            'type': 'A',
+            'value': '9.9.9.9',
+        })
+        zone_normal.add_record(normal)
+
+        included = Record.new(zone_included, 'www', {
+            'octodns': {
+                'included': ['not-here']
+            },
+            'ttl': 60,
+            'type': 'A',
+            'value': '9.9.9.9',
+        })
+        zone_included.add_record(included)
+
+        provider = SimpleProvider()
+
+        self.assertFalse(zone_normal.changes(zone_included, provider))
+        self.assertTrue(zone_normal.changes(zone_missing, provider))
+
+        self.assertFalse(zone_included.changes(zone_normal, provider))
+        self.assertFalse(zone_included.changes(zone_missing, provider))
+
+        self.assertTrue(zone_missing.changes(zone_normal, provider))
+        self.assertFalse(zone_missing.changes(zone_included, provider))

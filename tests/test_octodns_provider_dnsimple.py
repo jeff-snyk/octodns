@@ -9,6 +9,7 @@ from mock import Mock, call
 from os.path import dirname, join
 from requests import HTTPError
 from requests_mock import ANY, mock as requests_mock
+from six import text_type
 from unittest import TestCase
 
 from octodns.record import Record
@@ -37,7 +38,13 @@ class TestDnsimpleProvider(TestCase):
             break
 
     def test_populate(self):
+
+        # Sandbox
+        provider = DnsimpleProvider('test', 'token', 42, 'true')
+        self.assertTrue('sandbox' in provider._client.base)
+
         provider = DnsimpleProvider('test', 'token', 42)
+        self.assertFalse('sandbox' in provider._client.base)
 
         # Bad auth
         with requests_mock() as mock:
@@ -47,7 +54,7 @@ class TestDnsimpleProvider(TestCase):
             with self.assertRaises(Exception) as ctx:
                 zone = Zone('unit.tests.', [])
                 provider.populate(zone)
-            self.assertEquals('Unauthorized', ctx.exception.message)
+            self.assertEquals('Unauthorized', text_type(ctx.exception))
 
         # General error
         with requests_mock() as mock:
@@ -58,7 +65,7 @@ class TestDnsimpleProvider(TestCase):
                 provider.populate(zone)
             self.assertEquals(502, ctx.exception.response.status_code)
 
-        # Non-existant zone doesn't populate anything
+        # Non-existent zone doesn't populate anything
         with requests_mock() as mock:
             mock.get(ANY, status_code=404,
                      text='{"message": "Domain `foo.bar` not found"}')
@@ -78,14 +85,14 @@ class TestDnsimpleProvider(TestCase):
 
             zone = Zone('unit.tests.', [])
             provider.populate(zone)
-            self.assertEquals(15, len(zone.records))
+            self.assertEquals(16, len(zone.records))
             changes = self.expected.changes(zone, provider)
             self.assertEquals(0, len(changes))
 
         # 2nd populate makes no network calls/all from cache
         again = Zone('unit.tests.', [])
         provider.populate(again)
-        self.assertEquals(15, len(again.records))
+        self.assertEquals(16, len(again.records))
 
         # bust the cache
         del provider._zone_records[zone.name]
@@ -96,23 +103,23 @@ class TestDnsimpleProvider(TestCase):
                 mock.get(ANY, text=fh.read())
 
             zone = Zone('unit.tests.', [])
-            provider.populate(zone)
+            provider.populate(zone, lenient=True)
             self.assertEquals(set([
                 Record.new(zone, '', {
                     'ttl': 3600,
                     'type': 'SSHFP',
                     'values': []
-                }),
+                }, lenient=True),
                 Record.new(zone, '_srv._tcp', {
                     'ttl': 600,
                     'type': 'SRV',
                     'values': []
-                }),
+                }, lenient=True),
                 Record.new(zone, 'naptr', {
                     'ttl': 600,
                     'type': 'NAPTR',
                     'values': []
-                }),
+                }, lenient=True),
             ]), zone.records)
 
     def test_apply(self):
@@ -122,22 +129,48 @@ class TestDnsimpleProvider(TestCase):
         resp.json = Mock()
         provider._client._request = Mock(return_value=resp)
 
-        # non-existant domain, create everything
+        # non-existent domain, create everything
         resp.json.side_effect = [
             DnsimpleClientNotFound,  # no zone in populate
             DnsimpleClientNotFound,  # no domain during apply
         ]
         plan = provider.plan(self.expected)
 
-        # No root NS, no ignored
-        n = len(self.expected.records) - 2
+        # No root NS, no ignored, no excluded
+        n = len(self.expected.records) - 4
         self.assertEquals(n, len(plan.changes))
         self.assertEquals(n, provider.apply(plan))
+        self.assertFalse(plan.exists)
 
         provider._client._request.assert_has_calls([
             # created the domain
             call('POST', '/domains', data={'name': 'unit.tests'}),
-            # created at least one of the record with expected data
+            # created at least some of the record with expected data
+            call('POST', '/zones/unit.tests/records', data={
+                'content': '1.2.3.4',
+                'type': 'A',
+                'name': '',
+                'ttl': 300}),
+            call('POST', '/zones/unit.tests/records', data={
+                'content': '1.2.3.5',
+                'type': 'A',
+                'name': '',
+                'ttl': 300}),
+            call('POST', '/zones/unit.tests/records', data={
+                'content': '0 issue "ca.unit.tests"',
+                'type': 'CAA',
+                'name': '',
+                'ttl': 3600}),
+            call('POST', '/zones/unit.tests/records', data={
+                'content': '1 1 7491973e5f8b39d5327cd4e08bc81b05f7710b49',
+                'type': 'SSHFP',
+                'name': '',
+                'ttl': 3600}),
+            call('POST', '/zones/unit.tests/records', data={
+                'content': '1 1 bf6b6825d2977c511a475bbefb88aad54a92ac73',
+                'type': 'SSHFP',
+                'name': '',
+                'ttl': 3600}),
             call('POST', '/zones/unit.tests/records', data={
                 'content': '20 30 foo-1.unit.tests.',
                 'priority': 10,
@@ -147,7 +180,7 @@ class TestDnsimpleProvider(TestCase):
             }),
         ])
         # expected number of total calls
-        self.assertEquals(27, provider._client._request.call_count)
+        self.assertEquals(28, provider._client._request.call_count)
 
         provider._client._request.reset_mock()
 
@@ -186,6 +219,7 @@ class TestDnsimpleProvider(TestCase):
         }))
 
         plan = provider.plan(wanted)
+        self.assertTrue(plan.exists)
         self.assertEquals(2, len(plan.changes))
         self.assertEquals(2, provider.apply(plan))
         # recreate for update, and deletes for the 2 parts of the other

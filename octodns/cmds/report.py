@@ -13,9 +13,10 @@ from logging import getLogger
 from sys import stdout
 import re
 
+from six import text_type
+
 from octodns.cmds.args import ArgumentParser
 from octodns.manager import Manager
-from octodns.zone import Zone
 
 
 class AsyncResolver(Resolver):
@@ -54,7 +55,7 @@ def main():
     except KeyError as e:
         raise Exception('Unknown source: {}'.format(e.args[0]))
 
-    zone = Zone(args.zone, manager.configured_sub_zones(args.zone))
+    zone = manager.get_zone(args.zone)
     for source in sources:
         source.populate(zone)
 
@@ -65,7 +66,7 @@ def main():
         resolver = AsyncResolver(configure=False,
                                  num_workers=int(args.num_workers))
         if not ip_addr_re.match(server):
-            server = str(query(server, 'A')[0])
+            server = text_type(query(server, 'A')[0])
         log.info('server=%s', server)
         resolver.nameservers = [server]
         resolver.lifetime = int(args.timeout)
@@ -81,12 +82,12 @@ def main():
         stdout.write(',')
         stdout.write(record._type)
         stdout.write(',')
-        stdout.write(str(record.ttl))
+        stdout.write(text_type(record.ttl))
         compare = {}
         for future in futures:
             stdout.write(',')
             try:
-                answers = [str(r) for r in future.result()]
+                answers = [text_type(r) for r in future.result()]
             except (NoAnswer, NoNameservers):
                 answers = ['*no answer*']
             except NXDOMAIN:
